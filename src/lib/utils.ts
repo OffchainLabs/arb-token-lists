@@ -1,17 +1,17 @@
 import { TokenList } from '@uniswap/token-lists';
 import { readFileSync, existsSync } from 'fs';
 import axios from 'axios';
-import { L2Network, MultiCaller } from '@arbitrum/sdk';
+import { ethers } from 'ethers';
+import { CallInput, L2Network, MultiCaller } from '@arbitrum/sdk';
 import { L1GatewayRouter__factory } from '@arbitrum/sdk/dist/lib/abi/factories/L1GatewayRouter__factory';
 import { L2GatewayRouter__factory } from '@arbitrum/sdk/dist/lib/abi/factories/L2GatewayRouter__factory';
-
+import { TokenGateway__factory } from '@arbitrum/sdk/dist/lib/abi/factories/TokenGateway__factory';
+import { getGatewaysets } from './graph';
 import { ArbTokenList, GraphTokenResult } from './types';
 import path from 'path';
+import { exit } from 'process';
+import { Provider } from '@ethersproject/providers';
 import { tokenListIsValid } from './validateTokenList';
-import {
-  l2ToL1GatewayAddresses,
-  l2ToL1GatewayAddressesNova,
-} from './constants';
 import { getArgvs } from './options';
 
 export const isNetwork = () => {
@@ -85,15 +85,176 @@ export const promiseErrorMultiplier = <T>(
   });
 };
 
-export const getL1GatewayAddress = async (l2GatewayAddress: string) => {
-  const { isNova } = isNetwork();
-  const l2Gateway = isNova
-    ? l2ToL1GatewayAddressesNova[l2GatewayAddress.toLowerCase()]
-    : l2ToL1GatewayAddresses[l2GatewayAddress.toLowerCase()];
+export const generateGatewayMap = async (
+  l2Multicaller: MultiCaller,
+  l2Network: L2Network,
+  l1Provider: Provider,
+) => {
+  const l1GatewayResults: Map<string, string> = new Map();
+  const l1Token: any[] = [];
+  const gatewayMap: Map<string, string> = new Map();
 
-  if (l2Gateway) return l2Gateway;
+  //default gateway can be set during initialize call, it does not emit GatewaySet, so we should
+  //manually set it
+  const l1GatewayRouter = L1GatewayRouter__factory.connect(
+    l2Network.tokenBridge.l1GatewayRouter,
+    l1Provider,
+  );
+  const defaultGateway = await l1GatewayRouter.defaultGateway();
+  const defaultGatewayContract = new ethers.Contract(
+    defaultGateway,
+    TokenGateway__factory.abi,
+  ).connect(l1Provider);
+  const defaultCounterPartGateway =
+    await defaultGatewayContract.counterpartGateway();
+  gatewayMap.set(
+    defaultCounterPartGateway.toLowerCase(),
+    defaultGateway.toLowerCase(),
+  );
 
-  return undefined;
+  const gatewaySetsList = await getGatewaysets();
+  for (let i = 0; i < gatewaySetsList.length; i++) {
+    const tokenAddress = gatewaySetsList[i].l1Token;
+    let l1GatewayAddress = gatewaySetsList[i].gateway;
+
+    // This token on goerli doesn't set correctly, so we should ignore it.
+    if (
+      tokenAddress == '0x208d48e7eb3f316214c28894b3a6aea9e87c59a5' &&
+      l2Network.chainID == 421613
+    ) {
+      console.log(gatewaySetsList[i]);
+      continue;
+    }
+
+    //if gateway set to zero, which means it sets back to standard erc20 gateway
+    if (l1GatewayAddress === ethers.constants.AddressZero) {
+      l1GatewayAddress = l2Network.tokenBridge.l1ERC20Gateway;
+    }
+    l1GatewayResults.set(tokenAddress, l1GatewayAddress);
+    l1Token.push(tokenAddress);
+  }
+
+  const l2GatewayMaps = await getL2GatewayAddressesFromL1Token(
+    l1Token,
+    l2Multicaller,
+    l2Network,
+  );
+
+  //set gateway map
+  for (let i = 0; i < l1Token.length; i++) {
+    if (l2GatewayMaps[i] === ethers.constants.AddressZero) continue;
+    gatewayMap.set(
+      l2GatewayMaps[i].toLowerCase(),
+      l1GatewayResults.get(l1Token[i])!.toLowerCase(),
+    );
+  }
+
+  //edge case: gateway registered on l1 while not on l2
+  if (!(await checkMapResultByL2Gateway(gatewayMap, l2Multicaller))) {
+    exit(1);
+  }
+
+  console.log('Successfully generate gateway map');
+  return gatewayMap;
+};
+
+export const getL1GatewayAddress = async (
+  l2GatewayAddress: string,
+  l2ToL1GatewayAddresses: Map<string, string>,
+) => {
+  return l2ToL1GatewayAddresses.get(l2GatewayAddress.toLowerCase());
+};
+
+export const checkMapResultByL2Gateway = async (
+  l2ToL1GatewayAddresses: Map<string, string>,
+  l2Multicaller: MultiCaller,
+) => {
+  const keys = l2ToL1GatewayAddresses.keys();
+  const l2Gateways: string[] = [...keys];
+  const l1Gateways = await getL1GatewayFromL2Gateway(l2Gateways, l2Multicaller);
+  for (let i = 0; i < l2Gateways.length; i++) {
+    if (
+      l2ToL1GatewayAddresses.get(l2Gateways[i]) !== l1Gateways[i].toLowerCase()
+    ) {
+      console.log(
+        `Gateway map check invalid, invalid l2 gateway address is ` +
+          `${l2Gateways[i]}, invalid l1 gateway address is ${l1Gateways[i]}`,
+      );
+      return false;
+    }
+  }
+  return true;
+};
+
+const getCallInput = (
+  addr: string,
+  standardiFace: ethers.utils.Interface,
+): CallInput<string> => {
+  const { isArbOne, isGoerliRollup } = isNetwork();
+  // The graph token (grt) doesn't use our standard interface, we should handle it as this:
+  if (
+    (addr === '0x65e1a5e8946e7e87d9774f5288f41c30a99fd302' && isArbOne) ||
+    (addr === `0xef2757855d2802ba53733901f90c91645973f743` && isGoerliRollup)
+  ) {
+    const iFace = new ethers.utils.Interface([
+      'function l1Counterpart() view returns (address)',
+    ]);
+    return {
+      encoder: () => iFace.encodeFunctionData('l1Counterpart'),
+      decoder: (returnData: string) =>
+        iFace.decodeFunctionResult('l1Counterpart', returnData)[0] as string,
+      targetAddr: addr,
+    };
+  }
+  return {
+    encoder: () => standardiFace.encodeFunctionData('counterpartGateway'),
+    decoder: (returnData: string) =>
+      standardiFace.decodeFunctionResult(
+        'counterpartGateway',
+        returnData,
+      )[0] as string,
+    targetAddr: addr,
+  };
+};
+
+export const getL1GatewayFromL2Gateway = async (
+  l2Gateways: string[],
+  l2Multicaller: MultiCaller,
+): Promise<string[]> => {
+  const iFace = L2GatewayRouter__factory.createInterface();
+
+  const INC = 500;
+  let index = 0;
+  console.info(
+    'getL1GatewayFromL2Gateway for',
+    l2Gateways.length,
+    'l2 Gateways',
+  );
+
+  let l1Gateways: (string | undefined)[] = [];
+
+  while (index < l2Gateways.length) {
+    console.log(
+      'Getting tokens',
+      index,
+      'through',
+      Math.min(index + INC, l2Gateways.length),
+    );
+
+    const l2GatewaySlice = l2Gateways.slice(index, index + INC);
+    const result = await l2Multicaller.multiCall(
+      l2GatewaySlice.map((addr) => getCallInput(addr, iFace)),
+    );
+    l1Gateways = l1Gateways.concat(result);
+    index += INC;
+  }
+  for (const curr of l1Gateways) {
+    if (typeof curr === 'undefined') {
+      throw new Error('undefined l1 gateway!');
+    }
+  }
+
+  return l1Gateways as string[];
 };
 
 export const getL2GatewayAddressesFromL1Token = async (

@@ -44,3 +44,19 @@ export interface GraphTokenResult {
 export interface GraphTokensResult {
   tokens: GraphTokenResult[];
 }
+
+export interface GatewaySetResult {
+  id: string;
+  l1Token: string;
+  gateway: string;
+  blockNumber: string;
+}
+
+export interface GatewaySetsResult {
+  gatewaySets: GatewaySetResult[];
+}
+
+export interface GatewaySetInfo extends GatewaySetResult {
+  tx: string;
+  logIndex: number;
+}

@@ -1,27 +1,23 @@
 import { request, gql } from 'graphql-request';
 import { isNetwork } from './utils';
-import { GraphTokenResult, GraphTokensResult } from './types';
-import { excludeList } from './constants';
+import {
+  GraphTokenResult,
+  GraphTokensResult,
+  GatewaySetsResult,
+  GatewaySetInfo,
+} from './types';
+import {
+  excludeList,
+  tokenGatewayGraphEndpoints,
+  bridgeGraphEndpoints,
+} from './constants';
+import { getArgvs } from './options';
 
-const apolloL2GatewaysRinkebyClient =
-  'https://api.thegraph.com/subgraphs/name/fredlacs/layer2-token-gateway-rinkeby';
-const apolloL2GatewaysClient =
-  'https://api.thegraph.com/subgraphs/name/fredlacs/layer2-token-gateway';
-
-const appoloL2GatewaysGoerliRollupClient =
-  'https://api.thegraph.com/subgraphs/name/fredlacs/layer2-token-gateway-nitro-goerli';
-
-const chaidIdToGraphClientUrl = (chainID: string) => {
-  switch (chainID) {
-    case '42161':
-      return apolloL2GatewaysClient;
-    case '421611':
-      return apolloL2GatewaysRinkebyClient;
-    case '421613':
-      return appoloL2GatewaysGoerliRollupClient;
-    default:
-      throw new Error('Unsupported chain');
+const sortByTime = (a: GatewaySetInfo, b: GatewaySetInfo): number => {
+  if (Number(a.blockNumber) === Number(b.blockNumber)) {
+    return a.logIndex - b.logIndex;
   }
+  return Number(a.blockNumber) - Number(b.blockNumber);
 };
 
 const isGraphTokenResult = (obj: GraphTokenResult) => {
@@ -59,7 +55,7 @@ export const getTokens = async (
   }
   const networkID =
     typeof _networkID === 'number' ? _networkID.toString() : _networkID;
-  const clientUrl = chaidIdToGraphClientUrl(networkID);
+  const clientUrl = tokenGatewayGraphEndpoints[Number(networkID)];
   // lazy solution for big lists for now; we'll have to paginate once we have > 500 tokens registed
   if (tokenList.length > 500) {
     const allTokens = await getAllTokens(networkID);
@@ -100,7 +96,7 @@ export const getTokens = async (
   }
 `;
 
-  const { tokens } = (await request(clientUrl, query)) as GraphTokensResult;
+  const { tokens }: GraphTokensResult = await request(clientUrl, query);
   tokens.map((token) => isGraphTokenResult(token));
 
   return tokens.filter(
@@ -113,7 +109,7 @@ export const getAllTokens = async (
 ): Promise<Array<GraphTokenResult>> => {
   const networkID =
     typeof _networkID === 'number' ? _networkID.toString() : _networkID;
-  const clientUrl = chaidIdToGraphClientUrl(networkID);
+  const clientUrl = tokenGatewayGraphEndpoints[Number(networkID)];
   const blockNumber = graphGatewayBlockNumField(_networkID);
   const query = gql`
     {
@@ -137,7 +133,7 @@ export const getAllTokens = async (
     }
   `;
 
-  const { tokens } = (await request(clientUrl, query)) as GraphTokensResult;
+  const { tokens }: GraphTokensResult = await request(clientUrl, query);
   const res = tokens.map((token) => {
     isGraphTokenResult(token);
     return { ...token };
@@ -147,3 +143,35 @@ export const getAllTokens = async (
     (token) => !excludeList.includes(token.l1TokenAddr.toLowerCase()),
   );
 };
+
+export async function getGatewaysets(): Promise<any[]> {
+  const eventResult = [];
+  let currentResult: GatewaySetInfo[];
+  let skip = 0;
+  const clientUrl = bridgeGraphEndpoints[getArgvs().l2NetworkID];
+  do {
+    currentResult = [];
+    const query = gql`query EventQuery {
+                gatewaySets(first: 100, orderBy: id, skip: ${skip}) {
+                    id 
+                    l1Token 
+                    gateway
+                    blockNumber
+                    }   
+                }`;
+    const { gatewaySets }: GatewaySetsResult = await request(clientUrl, query);
+
+    //get logIndex only
+    for (let i = 0; i < gatewaySets.length; i++) {
+      currentResult[i] = {
+        ...gatewaySets[i],
+        tx: gatewaySets[i].id.substring(0, 66), //tx length 64 but there is 0x in front so it is 66
+        logIndex: 1,
+      };
+    }
+    eventResult.push(...currentResult);
+    skip += 100;
+  } while (currentResult.length == 100);
+  eventResult.sort(sortByTime);
+  return eventResult;
+}

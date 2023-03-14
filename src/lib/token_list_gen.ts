@@ -30,6 +30,7 @@ import {
   getChunks,
   promiseErrorMultiplier,
   getL1GatewayAddress,
+  generateGatewayMap,
 } from './utils';
 import { validateTokenListWithErrorThrowing } from './validateTokenList';
 import { constants as arbConstants } from '@arbitrum/sdk';
@@ -185,7 +186,11 @@ export const generateTokenList = async (
   }
 
   const tokenData = intermediateTokenData.flat(1);
-
+  const l2ToL1GatewayAddresses = await generateGatewayMap(
+    l2.multiCaller,
+    l2.network,
+    l1.provider,
+  );
   const _arbifiedTokenList = tokens
     .map((t, i) => ({
       token: t,
@@ -202,7 +207,8 @@ export const generateTokenList = async (
       const l2GatewayAddress =
         token.token.joinTableEntry[0].gateway.gatewayAddr;
       const l1GatewayAddress =
-        (await getL1GatewayAddress(l2GatewayAddress)) ?? 'N/A';
+        (await getL1GatewayAddress(l2GatewayAddress, l2ToL1GatewayAddresses)) ??
+        'N/A';
 
       let { name: _name, decimals, symbol: _symbol } = token.tokenDatum;
 
